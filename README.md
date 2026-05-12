@@ -119,29 +119,91 @@ rank   num_warmup   mu (in-flight) peak(VPP)    peak(1F1B)   ratio
 
 ### Warmup 数量（Megatron 源码）
 
-```python
-# 1F1B
-num_warmup(r) = P - r - 1
+$$
+\text{num warmup}(r) =
+\begin{cases}
+P - r - 1 & \text{(1F1B)} \\[6pt]
+(P - r - 1) \times 2 + (V - 1) \times N & \text{(VPP)}
+\end{cases}
+$$
 
-# VPP
-num_warmup(r) = (P - r - 1) * 2 + (V - 1) * N
-```
+其中 $N = \text{microbatch group size per vp stage}$，默认 $N = P$。
 
-### 在途激活值数量 μ(s)（BPipe 论文，当 N=P 时）
+### 在途激活值数量 $\mu(s)$（BPipe 论文，当 $N = P$ 时）
 
-```
-μ(s) = P · (V - 1) + 2 · (P - s - 1) + 1 = num_warmup + 1
-```
+$$
+\mu(s) = \text{num warmup}(s) + 1 = P \cdot (V - 1) + 2 \cdot (P - s - 1) + 1
+$$
 
-相邻 stage 的 μ 差为 2（VPP）或 1（1F1B）。
+简化后：
+
+$$
+\mu(s) = P \cdot V + P - 1 - 2s
+$$
+
+相邻 stage 的 $\mu$ 差为 $2$（VPP）或 $1$（1F1B）。
+
+| 调度方式 | $\mu(s)$ | 相邻差 |
+|----------|----------|--------|
+| 1F1B | $P - s$ | $1$ |
+| VPP | $P \cdot V + P - 1 - 2s$ | $2$ |
+
+### 激活值峰值
+
+stage $s$ 的激活显存峰值由三部分相乘得到：
+
+$$
+\text{Peak}(s) = \mu(s) \times \frac{\text{layers per device}}{V} \times \text{act per layer}
+$$
+
+其中：
+- $\mu(s)$：在途 micro-batch 数量
+- $\text{layers per device} / V$：每个 chunk 的层数（VPP 将设备上的层均分到 $V$ 个 chunk）
+- $\text{act per layer}$：每层每 micro-batch 的激活值大小
+
+**1F1B（$V = 1$）的峰值：**
+
+$$
+\text{Peak}_{\text{1F1B}}(s) = (P - s) \times \text{layers per device} \times \text{act per layer}
+$$
+
+**VPP 的峰值：**
+
+$$
+\text{Peak}_{\text{VPP}}(s) = (P \cdot V + P - 1 - 2s) \times \frac{\text{layers per device}}{V} \times \text{act per layer}
+$$
+
+### 各 rank 的峰值比
+
+**通用公式（任意 $P, V, N = P$）：**
+
+$$
+\frac{\text{Peak}_{\text{VPP}}(s)}{\text{Peak}_{\text{1F1B}}(s)} = \frac{P \cdot V + P - 1 - 2s}{V \times (P - s)}
+$$
+
+**各 rank 具体展开（$P = 4, V = 2$ 为例）：**
+
+| rank $s$ | $\mu_{\text{VPP}}$ | $\mu_{\text{1F1B}}$ | 峰值比公式 | 数值 |
+|----------|-------------------|---------------------|-----------|------|
+| $0$ | $4 \times 2 + 4 - 1 - 0 = 11$ | $4$ | $\frac{11}{2 \times 4} = \frac{11}{8}$ | $\times 1.375$ |
+| $1$ | $4 \times 2 + 4 - 1 - 2 = 9$ | $3$ | $\frac{9}{2 \times 3} = \frac{9}{6}$ | $\times 1.500$ |
+| $2$ | $4 \times 2 + 4 - 1 - 4 = 7$ | $2$ | $\frac{7}{2 \times 2} = \frac{7}{4}$ | $\times 1.750$ |
+| $3$ | $4 \times 2 + 4 - 1 - 6 = 5$ | $1$ | $\frac{5}{2 \times 1} = \frac{5}{2}$ | $\times 2.500$ |
+
+**关键结论：**
+- 系统瓶颈始终在 rank $0$，涨幅仅 $\frac{P \cdot V + P - 1}{V \cdot P}$
+- rank 末段（$s = P-1$）虽然比值最大，但绝对值最小，不构成瓶颈
+- 随着 $V$ 增大，rank $0$ 的峰值比趋近于 $2$（上界），而非 $V$ 倍
 
 ### Bubble Rate
 
-```
-近似式: (P - 1) / (V · M)          （M >> P 时准确）
-严格式: (P - 1) / (V · M + P - 1)   （精确公式）
-```
+$$
+\text{Bubble}_{\text{approx}} = \frac{P - 1}{V \cdot M} \quad \text{（} M \gg P \text{ 时准确）}
+$$
 
+$$
+\text{Bubble}_{\text{strict}} = \frac{P - 1}{V \cdot M + P - 1} \quad \text{（精确公式）}
+$$
 ## 依赖规则
 
 模拟器使用以下事件依赖规则进行全局时间调度：
